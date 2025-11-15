@@ -1,0 +1,5 @@
+# Code for Deng *et al* (2025) mislabeling manuscript
+
+Future home of the code release for Deng *et al* (2025),
+"Safeguarding informed consent via network-guided relabeling of
+mislabeled multi-omics data.", manuscript currently in preparation.
