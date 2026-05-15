@@ -1,0 +1,7 @@
+# Code for running FOMO on GTEx
+
+This is the code for running the FOMO mislabel solver on the bulk
+RNA-sequencing from the Genotype-Tissue Expression project. Note that
+because GTEx has so many samples, these scripts are designed to
+download each bam file temporarily for fingerprinting and then delete
+it afterward.

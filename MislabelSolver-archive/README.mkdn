@@ -1,0 +1,3 @@
+This is an early prototype of the FOMO before it was converted into an
+R package. It is included because some of the released analysis code
+uses this rather than the actual FOMO package.

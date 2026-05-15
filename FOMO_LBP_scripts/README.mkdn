@@ -1,0 +1,5 @@
+# Code for running FOMO on the Living Brain Project
+
+This is the code for running the FOMO mislabel solver on the bulk
+RNA-sequencing, single-cell RNA-sequencing, and whole-genome
+sequencing data from the Living Brain Project.

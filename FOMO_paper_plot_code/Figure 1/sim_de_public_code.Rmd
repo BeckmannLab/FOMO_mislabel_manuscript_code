@@ -1,0 +1,567 @@
+---
+title: "Simulation of Differential Expression with Mislabeled Samples"
+author: "Ryan C. Thompson"
+output: html_notebook
+---
+
+# Load packages
+
+```{r message=FALSE, warning=FALSE}
+library(rlang)
+is_named <- rlang::is_named
+library(withr)
+library(fs)
+path <- fs::path
+library(qs2)
+library(dplyr)
+filter <- dplyr::filter
+select <- dplyr::select
+rename <- dplyr::rename
+matches <- dplyr::matches
+mutate <- dplyr::mutate
+desc <- dplyr::desc
+library(tidyr)
+library(magrittr)
+subtract <- magrittr::subtract
+library(stringr)
+library(assertthat)
+library(ggplot2)
+library(scales)
+library(colorspace)
+library(patchwork)
+library(forcats)
+library(limma)
+library(statmod)
+library(qvalue)
+library(S4Vectors)
+library(future)
+library(future.apply)
+library(future.callr)
+plan(callr)
+```
+
+# Define simulation code
+
+```{r}
+digits <- function(x, base = 10) {
+    1 + floor(log(x, base = base))
+}
+generate_ids <- function(prefix, n) {
+    if (length(n) == 1) {
+        n <- seq_len(n)
+    }
+    num_digits <- digits(max(n))
+    digit_format <- str_c("%0", num_digits, "i")
+    str_c(prefix, sprintf(digit_format, n))
+}
+
+design_is_identifiable <- function(dmat, ...) {
+    qrd <- qr(x = dmat, ...)
+    qrd$rank == ncol(dmat)
+}
+
+coolcat_no_filter <- function(fmt, vals = character(), exdent = 2, ...) {
+    lbls <- paste(S4Vectors:::selectSome(vals), collapse = " ")
+    txt <- sprintf(fmt, length(vals), lbls)
+    cat(strwrap(txt, exdent = exdent, ...), sep = "\n")
+}
+
+# Function for introducing mislabels by permuting the data without permuting the
+# labels.
+reorder_elist_samples <- function(elist, ..., reorder_data = TRUE, reorder_targets = FALSE) {
+    o <- order(...)
+    if (all(o == seq_along(o))) {
+        return(elist)
+    }
+    assert_that(reorder_data || reorder_targets, msg = "Must reorder either data, targets, or both")
+    reordered_elist <- elist[, o]
+    if (!reorder_targets) {
+        reordered_elist$targets <- elist$targets
+        colnames(reordered_elist) <- colnames(elist)
+    }
+    if (!reorder_data) {
+        saved_colnames <- colnames(reordered_elist)
+        reordered_elist$E <- elist$E
+        reordered_elist$other <- elist$other
+        ## Make sure the colnames didn't get reordered
+        colnames(reordered_elist) <- saved_colnames
+    }
+    dimnames(reordered_elist) <- dimnames(reordered_elist)
+    return(reordered_elist)
+}
+
+sim_mislabeled_data <- function(
+        n_samples_per_group,
+        n_features,
+        n_swaps,
+        swap_systematic,
+        n_sv,
+        fraction_de_case,
+        case_sd,
+        sv_sd,
+        resid_sd,
+        seed
+) {
+    if (!missing(seed)) {
+        sim_params <- mget(c(
+            "n_samples_per_group",
+            "n_features",
+            "n_swaps",
+            "swap_systematic",
+            "n_sv",
+            "fraction_de_case",
+            "case_sd",
+            "sv_sd",
+            "resid_sd"
+        ))
+        res <- with_seed(seed, do.call(sim_mislabeled_data, sim_params))
+        res$params$seed <- seed
+        return(res)
+    }
+    assert_that(
+        n_samples_per_group > 1,
+        n_features > 0,
+        n_swaps >= 0,
+        n_swaps <= n_samples_per_group,
+        is.logical(swap_systematic),
+        n_sv >= 0,
+        fraction_de_case >= 0,
+        fraction_de_case <= 1,
+        case_sd >= 0,
+        sv_sd >= 0,
+        resid_sd >= 0
+    )
+    if (n_sv < 1 && sv_sd > 0) {
+        warning("Setting SV signal to zero since there are not SVs")
+        n_sv <- 1
+        sv_sd <- 0
+    }
+
+    ## Generate the samples
+    ctrl_samples <- generate_ids("Ctrl", n_samples_per_group)
+    case_samples <- generate_ids("Case", n_samples_per_group)
+    sample_meta_table <- tibble(
+        Sample_ID = c(ctrl_samples, case_samples),
+        Status = c(rep_along(ctrl_samples, "Control"), rep_along(case_samples, "Case")) %>%
+            factor(levels = c("Control", "Case")),
+        Mislabeled = FALSE
+    )
+    sv_names <- generate_ids("SV", n_sv)
+    for (svi in sv_names) {
+        sample_meta_table[[svi]] <- rnorm(nrow(sample_meta_table))
+    }
+
+    n_de_features <- round(n_features * fraction_de_case)
+    if (n_de_features == 0 && fraction_de_case != 0) {
+        warning("fraction_de_case is too small, no features are DE")
+    }
+
+    ## Generate the features
+    feature_meta_table <- tibble(
+        Feature_Number = seq_len(n_features),
+        DE = Feature_Number <= n_de_features,
+        Feature_ID = generate_ids("Feature", n_features) %>%
+            str_c(if_else(DE, "_DE", ""))
+    ) %>%
+        select(Feature_ID, Feature_Number, DE, everything())
+
+    ## Generate the coefs
+    design_case <- model.matrix(~ 1 + Status, sample_meta_table)[, 2, drop = FALSE] %>%
+        ## Convert to sum-to-zero
+        subtract(mean(unique(.)))
+    design_sv <- as.matrix(sample_meta_table[sv_names])
+    ## Use abs so that all true logFC are positive
+    eta_case <- design_case %*% matrix(ncol = n_features, nrow = ncol(design_case), abs(rnorm(n_features * ncol(design_case)))) %>%
+        ## Set all eta to 0 for non-DE genes
+        scale(center = FALSE, scale = if_else(feature_meta_table$DE, 1, Inf))
+    eta_sv <- design_sv %*% matrix(ncol = n_features, nrow = ncol(design_sv), rnorm(n_features * ncol(design_sv)))
+    eta_resid <- matrix(ncol = n_features, nrow = nrow(sample_meta_table), rnorm(n_features * nrow(sample_meta_table)))
+
+    ## Put all the expression effects together
+    expr_mat <- t(
+        eta_case * case_sd +
+            eta_sv * sv_sd +
+            eta_resid * resid_sd
+    ) %>%
+        set_colnames(sample_meta_table$Sample_ID) %>%
+        set_rownames(feature_meta_table$Feature_ID)
+    attr(expr_mat, "scaled:scale") <- NULL
+
+    ## Build the EList
+    elist <- new("EList", list(
+        E = expr_mat,
+        genes = as.data.frame(feature_meta_table),
+        targets = as.data.frame(sample_meta_table),
+        other = list(
+            eta_sv = t(eta_sv),
+            eta_case = t(eta_case),
+            eta_resid = t(eta_resid)
+        ),
+        params = mget(c(
+            "n_samples_per_group",
+            "n_features",
+            "n_swaps",
+            "swap_systematic",
+            "n_sv",
+            "fraction_de_case",
+            "case_sd",
+            "sv_sd",
+            "resid_sd"
+        ))
+    ))
+
+    ## Discard unused eta matrices
+    if (case_sd == 0 || n_de_features == 0) {
+        elist$other$eta_case <- NULL
+    }
+    if (sv_sd == 0) {
+        elist$other$eta_sv <- NULL
+    }
+    if (resid_sd == 0) {
+        elist$other$eta_resid <- NULL
+    }
+
+    ## Apply dimnames to all relevant sub-elements in the EList
+    dimnames(elist) <- dimnames(elist)
+
+    ## Generate swaps
+    if (swap_systematic) {
+        swaps <- cbind(
+            sample(ctrl_samples, n_swaps),
+            sample(case_samples, n_swaps)
+        )
+    } else {
+        swaps <- matrix(sample(sample_meta_table$Sample_ID, n_swaps * 2), ncol = 2)
+    }
+    swap_from <- match(swaps[, 1], sample_meta_table$Sample_ID)
+    swap_to <- match(swaps[, 2], sample_meta_table$Sample_ID)
+    swap_index <- seq_len(nrow(sample_meta_table))
+    swap_index[c(swap_from, swap_to)] <- c(swap_to, swap_from)
+
+    ## Record swap info in targets
+    elist$targets %<>%
+        mutate(
+            swap_index = swap_index,
+            Mislabeled = swap_index != seq_len(n())
+        )
+
+    ## Apply swaps to the expression matrix but not the targets,
+    ## thus generating mislabeled samples
+    reordered_elist <- reorder_elist_samples(elist, elist$targets$swap_index, reorder_data = TRUE, reorder_targets = FALSE)
+
+    return(reordered_elist)
+}
+
+run_sim <- function(..., handle_mislabels = c("ignore", "remove", "correct"), save_eta_matrices = FALSE) {
+    handle_mislabels <- as.character(handle_mislabels)
+    handle_mislabels <- match.arg(handle_mislabels)
+    message("Simulating dataset")
+    ## We simulate 2x as many subjects so we can use the 2nd half
+    ## for validation of real time prediction learned from the
+    ## entire first half.
+    elist <- sim_mislabeled_data(...)
+
+    # show_EList(elist)
+    ## The eta matrices take up a lot of space
+    if (!save_eta_matrices) {
+        message("Clearing eta matrices")
+        elist$other <- NULL
+    }
+    message("Handling mislabels with action: ", handle_mislabels)
+    if (handle_mislabels == "ignore") {
+        ## Do nothing
+    } else if (handle_mislabels == "remove") {
+        elist <- elist[, !elist$targets$Mislabeled]
+        if (ncol(elist) == 0) {
+            ## If we filtered out all the samples, return a result
+            ## table with all NA stats
+            tt <- elist$genes %>%
+                as_tibble() %>%
+                mutate(logFC = NA_real_, AveExpr = NA_real_, t = NA_real_, P.Value = NA_real_, adj.P.Val = NA_real_)
+            return(tt)
+        }
+    } else if (handle_mislabels == "correct") {
+        ## This should just recover the original elist with no
+        ## mislabeling
+        elist <- reorder_elist_samples(elist, elist$targets$swap_index, reorder_data = TRUE, reorder_targets = FALSE)
+    } else {
+        stop("Unrecognized value for handle_mislabels: ", handle_mislabels)
+    }
+    message("Running limma")
+    ## We model the surrogate variables because even swaps within
+    ## groups will compromise the modeling of SVs, which should
+    ## reduce the performance of the model.
+    sv_names <- str_subset(colnames(elist$targets), "^SV[0-9]+")
+    design_formula <- as.formula(str_c(c("~1", "Status", sv_names), collapse = "+"))
+    design <- model.matrix(design_formula, elist$targets)
+    fit <- eBayes(lmFit(elist, design), trend = FALSE, robust = FALSE)
+    tt <- topTable(fit, number = Inf, coef = "StatusCase")
+    message("Collecting results")
+    return(as_tibble(tt))
+}
+```
+
+# Set up simulation grid
+
+```{r}
+grid_list <- list(
+    tibble(handle_mislabels = fct_inorder(eval(formals(run_sim)$handle_mislabels))),
+    tibble(n_swaps = seq(from = 0, to = 100, by = 5)),
+    tibble(swap_systematic = c(FALSE, TRUE)),
+    ## Not varying any of these
+    tibble(
+        n_samples_per_group = 100,
+        n_features = 10000,
+        n_sv = 5,
+        fraction_de_case = 0.5,
+        case_sd = 0.1,
+        sv_sd = 0.02,
+        resid_sd = 0.05
+    ),
+    ## Run each simulation with a bunch of different seeds (odd number to facilitate median)
+    tibble(seed = seq(from = 1986, length.out = 101))
+)
+sim_param_names <- sort(unlist(sapply(grid_list, colnames)))
+sim_table <- grid_list %>%
+    Reduce(f = cross_join) %>%
+    distinct() %>%
+    filter(!(handle_mislabels == "remove" & n_swaps == n_samples_per_group)) %>%
+    arrange(seed)
+sim_table
+```
+
+# Run simulations
+
+```{r}
+sim_result_cache_path <- "sim_mislabel_de_results.qs2"
+if (file_exists(sim_result_cache_path)) {
+    message("Reading saved simulation results")
+    # Read the results file but filter/merge with current planned simulations
+    sim_result_table <- sim_table %>%
+        left_join(qs_read(sim_result_cache_path, nthreads = availableCores())) %>%
+        # Fill in any NULL entries with "not run yet" errors
+        mutate(top_table = if_else(
+            sapply(top_table, is.null),
+            list(try(stop("Simulation not run yet"), silent = TRUE)),
+            top_table
+        ))
+} else {
+    sim_result_table <- sim_table %>%
+        mutate(top_table = list(try(stop("Simulation not run yet"), silent = TRUE)))
+}
+
+need_to_run <- sapply(sim_result_table$top_table, is, "try-error")
+if (any(need_to_run)) {
+    message("Running ", sum(need_to_run), " simulations")
+    sim_result_table[need_to_run, ] %<>% mutate(top_table = {
+        map_args <- list(f = function(...) try(run_sim(...), silent = TRUE))
+        map_args[sim_param_names] <- .[sim_param_names]
+        do.call(future_Map, map_args)
+    })
+    need_to_run <- sapply(sim_result_table$top_table, is, "try-error")
+    assert_that(!any(need_to_run))
+    qs_save(sim_result_table, sim_result_cache_path, nthreads = availableCores())
+}
+```
+
+# Collect simulation results
+
+```{r}
+fdr_threshold <- 0.05
+
+sim_result_long_table <- sim_result_table %>%
+    filter(sapply(top_table, is.data.frame)) %>%
+    unnest(top_table) %>%
+    mutate(
+        ## All true logFC are >0, so negative logFC is a non-DE
+        ## call for our purposes
+        Called_DE = adj.P.Val <= fdr_threshold & logFC > 0,
+        Feature_Call = case_when(
+            DE & Called_DE ~ "TP",
+            DE & !Called_DE ~ "FN",
+            !DE & Called_DE ~ "FP",
+            !DE & !Called_DE ~ "TN",
+            .default = NA
+        ) %>% factor(levels = c("TP", "TN", "FP", "FN"))
+    )
+sim_result_perf_table <- sim_result_long_table %>%
+    filter(!is.na(Feature_Call)) %>%
+    group_by(pick(all_of(sim_param_names)), Feature_Call) %>%
+    summarise(Num_Genes = n(), .groups = "drop") %>%
+    pivot_wider(
+        names_from = "Feature_Call",
+        values_from = "Num_Genes",
+        values_fill = 0
+    ) %>%
+    mutate(
+        Recall = TP / (TP + FN),
+        Specificity = TN / (TN + FP),
+        Precision = TP / (TP + FP),
+        NPV = TN / (TN + FN),
+        FDR = FP / (FP + TP),
+        Accuracy = (TP + TN) / n_features
+    ) %>%
+    mutate(Swap_Type = if_else(swap_systematic, "Always swap case with control", "Swap pairs at random") %>% fct_inorder())
+# Set up the summary functions to exclude undefined values and handle zero-length input as we want
+summary_functions <- c(
+    mget(c("mean", "sd", "median", "IQR", "min", "max"), inherits = TRUE),
+    se = function(x) {
+        sd(x) / sqrt(length(x))
+    }
+) %>% lapply(function(orig_fun) {
+    function(x) {
+        x <- x[is.finite(x)]
+        if (length(x) == 0) {
+            return(NA_real_)
+        }
+        suppressWarnings(orig_fun(x))
+    }
+})
+sim_result_perf_summary_table <- sim_result_perf_table %>%
+    group_by(pick(all_of(setdiff(sim_param_names, "seed")))) %>%
+    summarise(
+        N_sims = n(),
+        across(
+            c(FN, FP, TN, TP, Recall, Specificity, Precision, NPV, FDR, Accuracy),
+            summary_functions
+        ),
+        .groups = "drop"
+    ) %>%
+    mutate(Swap_Type = if_else(swap_systematic, "Always swap case with control", "Swap pairs at random") %>% fct_inorder())
+
+sim_result_logfc_sign_table <- sim_result_long_table %>%
+    filter(
+        !is.na(Feature_Call),
+        adj.P.Val <= 0.05
+    ) %>%
+    group_by(pick(all_of(sim_param_names))) %>%
+    summarise(
+        Fraction_logFC_Correct = mean(sign(logFC) == 1),
+        .groups = "drop"
+    ) %>%
+    mutate(Swap_Type = if_else(swap_systematic, "Always swap case with control", "Swap pairs at random") %>% fct_inorder())
+```
+
+# Plot results
+
+```{r}
+sim_result_perf_table_plot <- sim_result_perf_table %>%
+    filter(n_swaps %% 10 == 0) %>%
+    droplevels()
+sim_result_logfc_sign_table_plot <- sim_result_logfc_sign_table %>%
+    filter(n_swaps %% 10 == 0) %>%
+    droplevels()
+```
+
+## Boxplots
+
+```{r fig.height=6, fig.width=8, warning=FALSE}
+perf_names <- c("Recall", "Precision")
+perf_ylim_max <- c(
+    Recall = 1,
+    Precision = 1
+)
+perf_boxplots <- lapply(
+    perf_names,
+    \(pn) ggplot(sim_result_perf_table_plot) +
+        aes(
+            x = n_swaps,
+            color = handle_mislabels,
+            fill = handle_mislabels,
+            group = handle_mislabels
+        ) +
+        aes_string(y = pn) +
+        ylim(0, perf_ylim_max[pn]) +
+        geom_boxplot(
+            aes(group = interaction(n_swaps, handle_mislabels, Swap_Type)),
+            alpha = 0.2,
+            position = position_dodge(width = 5, preserve = "single"),
+            show.legend = TRUE
+        ) +
+        facet_wrap("Swap_Type", axes = "margins") +
+        labs(
+            x = "Percent of samples mislabeled",
+            color = "How mislabels are handled",
+            fill = "How mislabels are handled"
+        ) +
+        scale_color_brewer(palette = "Set1", drop = FALSE) +
+        scale_fill_brewer(palette = "Set1", drop = FALSE) +
+        scale_x_continuous(breaks = seq(from = 0, to = 100, by = 20))
+) %>%
+    set_names(perf_names)
+
+boxp <- wrap_plots(
+    perf_boxplots[c("Recall", "Precision")],
+    ncol = 1,
+    guides = "collect"
+) &
+    theme(legend.position = "top")
+# Remove interior x axes
+for (i in seq_len(length(boxp) - 1)) {
+    boxp[[i]] <- boxp[[i]] +
+        theme(
+            axis.title.x = element_blank(),
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank()
+        )
+}
+print(boxp)
+with_pdf("sim_boxplot.pdf", print(boxp), width = 8, height = 6)
+qs_save(boxp, "sim_boxplot.qs2")
+```
+
+## logFC correct sign plot
+
+```{r fig.height=3, fig.width=8, warning=FALSE}
+logfc_sign_plot <- ggplot(sim_result_logfc_sign_table_plot) +
+    aes(
+        x = n_swaps,
+        y = Fraction_logFC_Correct,
+        color = handle_mislabels,
+        fill = handle_mislabels,
+        group = handle_mislabels
+    ) +
+    ylim(0, 1) +
+    geom_boxplot(
+        aes(group = interaction(n_swaps, handle_mislabels, Swap_Type)),
+        alpha = 0.2,
+        position = position_dodge(width = 5, preserve = "single"),
+        show.legend = TRUE
+    ) +
+    facet_wrap("Swap_Type", axes = "margins") +
+    labs(
+        x = "Percent of samples mislabeled",
+        color = "How mislabels are handled",
+        fill = "How mislabels are handled",
+        y = "DEGs with correct logFC sign"
+    ) +
+    scale_color_brewer(palette = "Set1", drop = FALSE) +
+    scale_fill_brewer(palette = "Set1", drop = FALSE) +
+    scale_x_continuous(breaks = seq(from = 0, to = 100, by = 20)) +
+    scale_y_continuous(labels = scales::percent) +
+    theme(legend.position = "top")
+print(logfc_sign_plot)
+with_pdf("sim_logFC_sign_boxplot.pdf", print(logfc_sign_plot), width = 8, height = 3)
+qs_save(logfc_sign_plot, "sim_logFC_sign_boxplot.qs2")
+```
+# Save tables
+
+```{r}
+sim_result_perf_table_export <- sim_result_perf_table_plot %>%
+    select(where(\(x) length(unique(x)) > 1)) %>%
+    select(-Swap_Type)
+sim_result_logfc_sign_table_export <- sim_result_logfc_sign_table_plot %>%
+    select(where(\(x) length(unique(x)) > 1)) %>%
+    select(-Swap_Type)
+full_table_export <- full_join(
+    sim_result_perf_table_export,
+    sim_result_logfc_sign_table_export
+)
+write.xlsx(
+    full_table_export,
+    "sim_DE_result_table.xlsx",
+    asTable = TRUE,
+    firstRow = TRUE,
+    colWidths = "auto"
+)
+```

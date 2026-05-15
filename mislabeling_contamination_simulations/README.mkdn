@@ -1,0 +1,11 @@
+# Mislabel simulation with contamination code for *Deng et al. 2026*
+
+This is the code for running simulations of running the FOMO mislabel
+solver on simulated data sets with varying sizes, mislabel rates,
+contamination, and other parameters. The code is intended to run on
+Mount Sinai's minerva HPC cluster using LSF for batch job management.
+
+These simulations were run while FOMO was still in development, so the
+scripts assume that a copy of the FOMO repo has been placed in the
+`fomo` subdirectory (they use `devtools::load_all()` on that
+directory).
