@@ -1,0 +1,21 @@
+# Code release for *Deng et al. 2026*
+
+This repository contains the public release of all analysis code used
+in the *Deng et al. 2026, A scalable framework for automated
+relabeling of mislabeled multi-omics samples*. It is organized into
+separate subfolders for each of several analyses.
+
+Note that the FOMO package itself is released in a separate
+repository.
+
+## Redactions
+
+Please note that certain lines of code refer to internal details of
+our computing environment and/or internal identifiers that cannot be
+released publicly. These lines of code have been partially or
+completely redacted in this public release. When practical, comments
+has been added explaining the reason for the redaction and what the
+redacted line of code would have done.
+
+For similar reasons, we also cannot release the full git history of
+this code.
